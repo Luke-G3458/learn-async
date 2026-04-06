@@ -2338,3 +2338,63 @@ Worker 2 shutting down
 Worker 3 shutting down
 ```
 Check it out. No more hanging at the end. Manager thread is able to receive worker feedback and main thread messages without blocking, and it shuts down gracefully when main thread is done. This is what I wanted to achieve.
+
+### Project Optimization
+1. Use a `VecDeque` instead of a `Vec` for the job queue and available worker list, so that for jobs we get the oldest job instead of the newest job, and for workers we avoid overworking the most recently used worker.
+2. Other smaller things.
+> See `src/` for the final optimized code.
+
+#### Output
+```
+Worker 0 starting
+Worker 0 received job     // available workers: 0, 1, 2, 3; worker 0 gets job 0
+Job 0 is running
+Worker 3 starting
+Worker 3 received job     // available workers: 1, 2, 3; worker 3 gets job 3
+Job 3 is running
+Worker 1 starting
+Worker 1 received job     // available workers: 1, 2; worker 1 gets job 1
+Job 1 is running
+Worker 2 starting
+Worker 2 received job     // available workers: 2; worker 2 gets job 2
+Job 2 is running
+job 0 is done
+Worker 0 finished job     // available workers: 0
+job 1 is done
+Worker 1 finished job     // available workers: 0, 1
+Worker 1 received job     // available workers: 0, 1; worker 1 gets job 5
+Job 5 is running
+job 3 is done
+Worker 3 finished job     // available workers: 0, 3
+Worker 0 received job     // available workers: 0; worker 0 gets job 4
+Job 4 is running
+Worker 3 received job     // available workers: 3; worker 3 gets job 6
+Job 6 is running
+job 2 is done
+Worker 2 finished job     // available workers: 2
+Worker 2 received job     // available workers: 2; worker 2 gets job 7
+Job 7 is running
+job 5 is done
+Worker 1 finished job     // available workers: 1
+Worker 1 received job     // available workers: 1; worker 1 gets job 8
+job 4 is done
+Worker 0 finished job     // available workers: 0
+job 6 is done
+Worker 3 finished job     // available workers: 0, 3
+job 7 is done
+Worker 2 finished job     // available workers: 0, 2, 3
+Job 8 is running
+Worker 0 received job     // available workers: 0, 2, 3; worker 0 gets job 9
+Job 9 is running
+job 9 is done
+Worker 0 finished job     // available workers: 0, 2, 3
+job 8 is done
+Worker 1 finished job     // available workers: 0, 1, 2, 3
+Worker 0 shutting down
+Worker 1 shutting down
+Worker 2 shutting down
+Worker 3 shutting down
+```
+comments (//) mine
+
+I think we're done here.

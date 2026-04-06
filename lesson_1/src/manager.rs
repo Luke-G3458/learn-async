@@ -1,4 +1,5 @@
 use crate::worker::Worker;
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -34,7 +35,7 @@ impl Manager {
         }
     }
 
-    pub fn schedule(&mut self, job: Job) {
+    pub fn schedule(&self, job: Job) {
         self.main_sender.send(Message::AssignJob(job)).unwrap();
     }
 }
@@ -50,53 +51,45 @@ impl Drop for Manager {
 
 pub struct ManagerThread {
     workers: Vec<Worker>,
-    available_workers: Vec<usize>,
-    jobs: Vec<Job>,
+    available_workers: VecDeque<usize>,
+    jobs: VecDeque<Job>,
 }
 
 impl ManagerThread {
     pub fn new(num_workers: usize, sender: Sender<Message>) -> Self {
-        let mut workers = Vec::new();
-        let mut available_workers = Vec::new();
+        let mut workers = Vec::with_capacity(num_workers);
+        let mut available_workers = VecDeque::with_capacity(num_workers);
         for id in 0..num_workers {
             let (assignment_sender, receiver) = mpsc::channel();
             workers.push(Worker::new(id, receiver, assignment_sender, sender.clone()));
-            available_workers.push(id);
+            available_workers.push_back(id);
         }
         Self {
             workers,
             available_workers,
-            jobs: vec![],
+            jobs: VecDeque::new(),
         }
     }
 
     pub fn run(&mut self, receiver: Receiver<Message>) {
-        let mut job_available: bool;
-        let mut worker_available: bool;
         let mut shutting_down = false;
 
         loop {
             while let Ok(msg) = receiver.try_recv() {
                 match msg {
-                    Message::AssignJob(job) => self.jobs.push(job),
+                    Message::AssignJob(job) => self.jobs.push_back(job),
                     Message::WorkerFinished(feedback) => {
-                        self.available_workers.push(feedback.worker_id)
+                        self.available_workers.push_back(feedback.worker_id)
                     }
                     Message::Close => shutting_down = true,
                 }
             }
 
-            job_available = !self.jobs.is_empty();
-            worker_available = !self.available_workers.is_empty();
-
-            while job_available && worker_available {
-                let job = self.jobs.pop().unwrap();
-                let worker_id = self.available_workers.pop().unwrap();
+            while !self.jobs.is_empty() && !self.available_workers.is_empty() {
+                let job = self.jobs.pop_front().unwrap();
+                let worker_id = self.available_workers.pop_front().unwrap();
 
                 self.assign_job(worker_id, job);
-
-                job_available = !self.jobs.is_empty();
-                worker_available = !self.available_workers.is_empty();
             }
 
             if shutting_down
@@ -109,10 +102,10 @@ impl ManagerThread {
             if self.jobs.is_empty() || self.available_workers.is_empty() {
                 match receiver.recv() {
                     Ok(msg) => match msg {
-                        Message::AssignJob(job) => self.jobs.push(job),
+                        Message::AssignJob(job) => self.jobs.push_back(job),
                         Message::Close => shutting_down = true,
                         Message::WorkerFinished(feedback) => {
-                            self.available_workers.push(feedback.worker_id)
+                            self.available_workers.push_back(feedback.worker_id)
                         }
                     },
                     Err(_) => shutting_down = true,
