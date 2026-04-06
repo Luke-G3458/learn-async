@@ -3,15 +3,12 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let mut manager = Manager::new(4);
+    let mut manager = Manager::start(4);
     for i in 0..10 {
-        manager.schedule_job(Box::new(move || {
+        manager.schedule(Box::new(move || {
             println!("Job {} is running", i);
             thread::sleep(Duration::from_secs(1));
             println!("job {} is done", i);
         }));
-    }
-    for _ in 0..10 {
-        manager.tick();
     }
 }

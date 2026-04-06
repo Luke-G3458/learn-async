@@ -1043,10 +1043,12 @@ pub struct JobFinished {
     pub worker_id: usize,
 }
 
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
 pub struct Manager {
     workers: Vec<Worker>,
     feedback_receiver: std::sync::mpsc::Receiver<JobFinished>,
-    jobs: Vec<Box<dyn FnOnce() + Send + 'static>>,
+    jobs: Vec<Job>,
 }
 
 impl Manager {
@@ -1105,7 +1107,7 @@ impl Manager {
         }
     }
 
-    pub fn schedule_job(&mut self, job: Box<dyn FnOnce() + Send + 'static>) {
+    pub fn schedule_job(&mut self, job: Job) {
         if let Some(available_workers) = self.get_available_workers() {
             for available_worker_id in available_workers {
                 self.assign_job(available_worker_id, job);
@@ -1115,7 +1117,7 @@ impl Manager {
         self.jobs.push(job);
     }
 
-    pub fn assign_job(&mut self, worker_id: usize, job: Box<dyn FnOnce() + Send + 'static>) {
+    pub fn assign_job(&mut self, worker_id: usize, job: Job) {
         for worker in &mut self.workers {
             if worker.id == worker_id {
                 worker.busy = true;
@@ -1144,20 +1146,20 @@ impl Drop for Manager {
 
 > worker.rs
 ```rust
-use crate::manager::JobFinished;
+use crate::manager::{Job, JobFinished};
 
 pub struct Worker {
     pub id: usize,
     pub handle: Option<std::thread::JoinHandle<()>>,
-    pub assignment_sender: Option<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>>,
+    pub assignment_sender: Option<std::sync::mpsc::Sender<Job>>,
     pub busy: bool,
 }
 
 impl Worker {
     pub fn new(
         id: usize,
-        receiver: std::sync::mpsc::Receiver<Box<dyn FnOnce() + Send + 'static>>,
-        assignment_sender: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+        receiver: std::sync::mpsc::Receiver<Job>,
+        assignment_sender: std::sync::mpsc::Sender<Job>,
         feedback_sender: std::sync::mpsc::Sender<JobFinished>,
     ) -> Self {
         let handle = std::thread::spawn(move || {
@@ -1249,3 +1251,1090 @@ Worker 2 shutting down
 Worker 3 shutting down
 ```
 Oh ya. That's what I'm talking about. Took be 2 hours, but check that out. Next step is just to optimize it.
+
+## Project 2 Architectural Overhaul
+- Manager has its own thread, and main just calls `manager.schedule_job()` to add jobs to manager's job queue.
+- Remove `.tick()` method. Manager thread continuously listens for job completed feedback from workers and assigns jobs to workers as they come in, rather than waiting for the main thread to call `.tick()`. (Issue: If a worker isn't done with a job and the manager thread calls `.recv()` to listen for feedback, then the manager thread will be blocked and unable to assign jobs to other workers that may be available. A similar issue is possible when receiving jobs from the main thread.)
+- `available_workers` field in the manager struct which is used to maintain a list of available workers.
+Follow this structure using this `while let` syntax to avoid blocking, something I didn't know about until now:
+```rust
+loop {
+    // 1. Drain finished jobs (non-blocking)
+    while let Ok(msg) = feedback_receiver.try_recv() {
+        mark worker available
+    }
+
+    // 2. Assign jobs while possible
+    while job + worker available {
+        assign job to worker
+    }
+
+    // 3. Nothing left → block until something happens
+    let msg = feedback_receiver.recv().unwrap();
+        mark worker available
+}
+```
+### Attempt 1
+> manager.rs
+```rust
+use crate::worker::Worker;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+
+pub struct JobFinished {
+    pub worker_id: usize,
+}
+
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub struct Manager {
+    main_sender: Sender<Job>,
+}
+
+impl Manager {
+    pub fn start(num_workers: usize) -> Self {
+        let (main_sender, main_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut manager = ManagerThread::new(num_workers);
+            manager.run(main_receiver);
+        });
+        Self { main_sender }
+    }
+
+    pub fn schedule(&mut self, job: Job) {
+        self.main_sender.send(job).unwrap();
+    }
+}
+
+pub struct ManagerThread {
+    workers: Vec<Worker>,
+    available_workers: Vec<usize>,
+    feedback_receiver: Receiver<JobFinished>,
+    jobs: Vec<Job>,
+}
+
+impl ManagerThread {
+    pub fn new(num_workers: usize) -> Self {
+        let mut workers = Vec::new();
+        let mut available_workers = Vec::new();
+        let (sender, receiver) = mpsc::channel();
+        for id in 0..num_workers {
+            let (assignment_sender, receiver) = mpsc::channel();
+            workers.push(Worker::new(id, receiver, assignment_sender, sender.clone()));
+            available_workers.push(id);
+        }
+        Self {
+            workers,
+            available_workers,
+            feedback_receiver: receiver,
+            jobs: vec![],
+        }
+    }
+
+    pub fn run(&mut self, main_receiver: Receiver<Job>) {
+        loop {
+            while let Ok(msg) = self.feedback_receiver.try_recv() {
+                self.available_workers.push(msg.worker_id);
+            }
+
+            while let Ok(job) = main_receiver.try_recv() {
+                self.jobs.push(job);
+            }
+
+            let mut job_available = !self.jobs.is_empty();
+            let mut worker_available = !self.available_workers.is_empty();
+
+            while job_available && worker_available {
+                let job = self.jobs.pop().unwrap();
+                let worker_id = self.available_workers.pop().unwrap();
+
+                self.assign_job(worker_id, job);
+                job_available = !self.jobs.is_empty();
+                worker_available = !self.available_workers.is_empty();
+            }
+        }
+    }
+
+    pub fn assign_job(&mut self, worker_id: usize, job: Job) {
+        let worker = &self.workers[worker_id];
+        if let Some(sender) = &worker.assignment_sender {
+            sender.send(job).unwrap();
+        }
+    }
+}
+
+impl Drop for ManagerThread {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            if let Some(sender) = worker.assignment_sender.take() {
+                drop(sender)
+            }
+            if let Some(handle) = worker.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+```
+> worker.rs
+```rust
+use crate::manager::{Job, JobFinished};
+
+pub struct Worker {
+    pub id: usize,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+    pub assignment_sender: Option<std::sync::mpsc::Sender<Job>>,
+}
+
+impl Worker {
+    pub fn new(
+        id: usize,
+        receiver: std::sync::mpsc::Receiver<Job>,
+        assignment_sender: std::sync::mpsc::Sender<Job>,
+        feedback_sender: std::sync::mpsc::Sender<JobFinished>,
+    ) -> Self {
+        let handle = std::thread::spawn(move || {
+            println!("Worker {} starting", id);
+            loop {
+                match receiver.recv() {
+                    Ok(job) => {
+                        println!("Worker {} received job", id);
+                        job();
+                        println!("Worker {} finished job", id);
+                        feedback_sender.send(JobFinished { worker_id: id }).unwrap();
+                    }
+                    Err(_) => {
+                        println!("Worker {} shutting down", id);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            id,
+            handle: Some(handle),
+            assignment_sender: Some(assignment_sender),
+        }
+    }
+}
+```
+#### Known Issues
+Will not stop gracefully. This would be a huge mess. I need to
+- Know when main is closing. This will be done through Message enum with variants `Job(job)` and `Close`. If the manager thread receives a `Close` message from main thread, then it will break the loop and drop. Then I will implement a Drop for ManagerThread that drops all senders and joins all threads.
+### Atempt 2
+> manager.rs
+```rust
+use crate::worker::Worker;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+
+pub struct JobFinished {
+    pub worker_id: usize,
+}
+
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub enum Message {
+    AssignJob(Job),
+    Close,
+}
+
+pub struct Manager {
+    main_sender: Sender<Message>,
+}
+
+impl Manager {
+    pub fn start(num_workers: usize) -> Self {
+        let (main_sender, main_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut manager = ManagerThread::new(num_workers);
+            manager.run(main_receiver);
+        });
+        Self { main_sender }
+    }
+
+    pub fn schedule(&mut self, job: Job) {
+        self.main_sender.send(Message::AssignJob(job)).unwrap();
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.main_sender.send(Message::Close).unwrap();
+    }
+}
+
+pub struct ManagerThread {
+    workers: Vec<Worker>,
+    available_workers: Vec<usize>,
+    feedback_receiver: Receiver<JobFinished>,
+    jobs: Vec<Job>,
+}
+
+impl ManagerThread {
+    pub fn new(num_workers: usize) -> Self {
+        let mut workers = Vec::new();
+        let mut available_workers = Vec::new();
+        let (sender, receiver) = mpsc::channel();
+        for id in 0..num_workers {
+            let (assignment_sender, receiver) = mpsc::channel();
+            workers.push(Worker::new(id, receiver, assignment_sender, sender.clone()));
+            available_workers.push(id);
+        }
+        Self {
+            workers,
+            available_workers,
+            feedback_receiver: receiver,
+            jobs: vec![],
+        }
+    }
+
+    pub fn run(&mut self, main_receiver: Receiver<Message>) {
+        loop {
+            while let Ok(msg) = self.feedback_receiver.try_recv() {
+                self.available_workers.push(msg.worker_id);
+            }
+
+            while let Ok(msg) = main_receiver.try_recv() {
+                match msg {
+                    Message::AssignJob(job) => self.jobs.push(job),
+                    Message::Close => break,
+                }
+            }
+
+            let mut job_available = !self.jobs.is_empty();
+            let mut worker_available = !self.available_workers.is_empty();
+
+            while job_available && worker_available {
+                let job = self.jobs.pop().unwrap();
+                let worker_id = self.available_workers.pop().unwrap();
+
+                self.assign_job(worker_id, job);
+                job_available = !self.jobs.is_empty();
+                worker_available = !self.available_workers.is_empty();
+            }
+        }
+    }
+
+    pub fn assign_job(&mut self, worker_id: usize, job: Job) {
+        let worker = &self.workers[worker_id];
+        if let Some(sender) = &worker.assignment_sender {
+            sender.send(job).unwrap();
+        }
+    }
+}
+
+impl Drop for ManagerThread {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            if let Some(sender) = worker.assignment_sender.take() {
+                drop(sender)
+            }
+            if let Some(handle) = worker.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+```
+> worker.rs
+```rust
+use crate::manager::{Job, JobFinished};
+
+pub struct Worker {
+    pub id: usize,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+    pub assignment_sender: Option<std::sync::mpsc::Sender<Job>>,
+}
+
+impl Worker {
+    pub fn new(
+        id: usize,
+        receiver: std::sync::mpsc::Receiver<Job>,
+        assignment_sender: std::sync::mpsc::Sender<Job>,
+        feedback_sender: std::sync::mpsc::Sender<JobFinished>,
+    ) -> Self {
+        let handle = std::thread::spawn(move || {
+            println!("Worker {} starting", id);
+            loop {
+                match receiver.recv() {
+                    Ok(job) => {
+                        println!("Worker {} received job", id);
+                        job();
+                        println!("Worker {} finished job", id);
+                        feedback_sender.send(JobFinished { worker_id: id }).unwrap();
+                    }
+                    Err(_) => {
+                        println!("Worker {} shutting down", id);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            id,
+            handle: Some(handle),
+            assignment_sender: Some(assignment_sender),
+        }
+    }
+}
+```
+#### Known issues
+CPU will just loop and loop and loop in the manager thread. Need a way to block it.
+#### Solution
+Update the `run()` impl on `MainThread` to be this:
+```rust
+    pub fn run(&mut self, main_receiver: Receiver<Message>) {
+        loop {
+            while let Ok(msg) = self.feedback_receiver.try_recv() {
+                self.available_workers.push(msg.worker_id);
+            }
+
+            while let Ok(msg) = main_receiver.try_recv() {
+                match msg {
+                    Message::AssignJob(job) => self.jobs.push(job),
+                    Message::Close => break,
+                }
+            }
+
+            let mut job_available = !self.jobs.is_empty();
+            let mut worker_available = !self.available_workers.is_empty();
+
+            while job_available && worker_available {
+                let job = self.jobs.pop().unwrap();
+                let worker_id = self.available_workers.pop().unwrap();
+
+                self.assign_job(worker_id, job);
+                job_available = !self.jobs.is_empty();
+                worker_available = !self.available_workers.is_empty();
+            }
+
+            if self.jobs.is_empty() { // <--- New code here
+                match main_receiver.recv() {
+                    Ok(msg) => match msg {
+                        Message::AssignJob(job) => self.jobs.push(job),
+                        Message::Close => break,
+                    },
+                    Err(_) => break,
+                }
+            }
+        }
+```
+
+### Attempt 3 (using previous solution)
+> main.rs
+```rust
+use lesson_1::manager::Manager;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let mut manager = Manager::start(4);
+    for i in 0..10 {
+        manager.schedule(Box::new(move || {
+            println!("Job {} is running", i);
+            thread::sleep(Duration::from_secs(1));
+            println!("job {} is done", i);
+        }));
+    }
+}
+```
+> manager.rs
+```rust
+use crate::worker::Worker;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+
+pub struct JobFinished {
+    pub worker_id: usize,
+}
+
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub enum Message {
+    AssignJob(Job),
+    Close,
+}
+
+pub struct Manager {
+    main_sender: Sender<Message>,
+}
+
+impl Manager {
+    pub fn start(num_workers: usize) -> Self {
+        let (main_sender, main_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut manager = ManagerThread::new(num_workers);
+            manager.run(main_receiver);
+        });
+        Self { main_sender }
+    }
+
+    pub fn schedule(&mut self, job: Job) {
+        self.main_sender.send(Message::AssignJob(job)).unwrap();
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.main_sender.send(Message::Close).unwrap();
+    }
+}
+
+pub struct ManagerThread {
+    workers: Vec<Worker>,
+    available_workers: Vec<usize>,
+    feedback_receiver: Receiver<JobFinished>,
+    jobs: Vec<Job>,
+}
+
+impl ManagerThread {
+    pub fn new(num_workers: usize) -> Self {
+        let mut workers = Vec::new();
+        let mut available_workers = Vec::new();
+        let (sender, receiver) = mpsc::channel();
+        for id in 0..num_workers {
+            let (assignment_sender, receiver) = mpsc::channel();
+            workers.push(Worker::new(id, receiver, assignment_sender, sender.clone()));
+            available_workers.push(id);
+        }
+        Self {
+            workers,
+            available_workers,
+            feedback_receiver: receiver,
+            jobs: vec![],
+        }
+    }
+
+    pub fn run(&mut self, main_receiver: Receiver<Message>) {
+        loop {
+            while let Ok(msg) = self.feedback_receiver.try_recv() {
+                self.available_workers.push(msg.worker_id);
+            }
+
+            while let Ok(msg) = main_receiver.try_recv() {
+                match msg {
+                    Message::AssignJob(job) => self.jobs.push(job),
+                    Message::Close => break,
+                }
+            }
+
+            let mut job_available = !self.jobs.is_empty();
+            let mut worker_available = !self.available_workers.is_empty();
+
+            while job_available && worker_available {
+                let job = self.jobs.pop().unwrap();
+                let worker_id = self.available_workers.pop().unwrap();
+
+                self.assign_job(worker_id, job);
+                job_available = !self.jobs.is_empty();
+                worker_available = !self.available_workers.is_empty();
+            }
+
+            if self.jobs.is_empty() {
+                match main_receiver.recv() {
+                    Ok(msg) => match msg {
+                        Message::AssignJob(job) => self.jobs.push(job),
+                        Message::Close => break,
+                    },
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    pub fn assign_job(&mut self, worker_id: usize, job: Job) {
+        let worker = &self.workers[worker_id];
+        if let Some(sender) = &worker.assignment_sender {
+            sender.send(job).unwrap();
+        }
+    }
+}
+
+impl Drop for ManagerThread {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            if let Some(sender) = worker.assignment_sender.take() {
+                drop(sender)
+            }
+            if let Some(handle) = worker.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+```
+> worker.rs
+```rust
+use crate::manager::{Job, JobFinished};
+
+pub struct Worker {
+    pub id: usize,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+    pub assignment_sender: Option<std::sync::mpsc::Sender<Job>>,
+}
+
+impl Worker {
+    pub fn new(
+        id: usize,
+        receiver: std::sync::mpsc::Receiver<Job>,
+        assignment_sender: std::sync::mpsc::Sender<Job>,
+        feedback_sender: std::sync::mpsc::Sender<JobFinished>,
+    ) -> Self {
+        let handle = std::thread::spawn(move || {
+            println!("Worker {} starting", id);
+            loop {
+                match receiver.recv() {
+                    Ok(job) => {
+                        println!("Worker {} received job", id);
+                        job();
+                        println!("Worker {} finished job", id);
+                        feedback_sender.send(JobFinished { worker_id: id }).unwrap();
+                    }
+                    Err(_) => {
+                        println!("Worker {} shutting down", id);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            id,
+            handle: Some(handle),
+            assignment_sender: Some(assignment_sender),
+        }
+    }
+}
+```
+
+### Attempt 4 (more changes)
+> manager.rs
+```rust
+use crate::worker::Worker;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::{self, JoinHandle};
+
+pub struct JobFinished {
+    pub worker_id: usize,
+}
+
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub enum Message {
+    AssignJob(Job),
+    Close,
+}
+
+pub struct Manager {
+    main_sender: Sender<Message>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Manager {
+    pub fn start(num_workers: usize) -> Self {
+        let (main_sender, main_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut manager = ManagerThread::new(num_workers);
+            manager.run(main_receiver);
+        });
+        Self {
+            main_sender,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn schedule(&mut self, job: Job) {
+        self.main_sender.send(Message::AssignJob(job)).unwrap();
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.main_sender.send(Message::Close).unwrap();
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        };
+    }
+}
+
+pub struct ManagerThread {
+    workers: Vec<Worker>,
+    available_workers: Vec<usize>,
+    feedback_receiver: Receiver<JobFinished>,
+    jobs: Vec<Job>,
+}
+
+impl ManagerThread {
+    pub fn new(num_workers: usize) -> Self {
+        let mut workers = Vec::new();
+        let mut available_workers = Vec::new();
+        let (sender, receiver) = mpsc::channel();
+        for id in 0..num_workers {
+            let (assignment_sender, receiver) = mpsc::channel();
+            workers.push(Worker::new(id, receiver, assignment_sender, sender.clone()));
+            available_workers.push(id);
+        }
+        Self {
+            workers,
+            available_workers,
+            feedback_receiver: receiver,
+            jobs: vec![],
+        }
+    }
+
+    pub fn run(&mut self, main_receiver: Receiver<Message>) {
+        let mut shutting_down = false;
+
+        loop {
+            while let Ok(msg) = self.feedback_receiver.try_recv() {
+                self.available_workers.push(msg.worker_id);
+            }
+
+            while let Ok(msg) = main_receiver.try_recv() {
+                match msg {
+                    Message::AssignJob(job) => self.jobs.push(job),
+                    Message::Close => shutting_down = true,
+                }
+            }
+
+            let mut job_available = !self.jobs.is_empty();
+            let mut worker_available = !self.available_workers.is_empty();
+
+            while job_available && worker_available {
+                let job = self.jobs.pop().unwrap();
+                let worker_id = self.available_workers.pop().unwrap();
+
+                self.assign_job(worker_id, job);
+                job_available = !self.jobs.is_empty();
+                worker_available = !self.available_workers.is_empty();
+            }
+
+            if shutting_down
+                && self.jobs.is_empty()
+                && self.available_workers.len() == self.workers.len()
+            {
+                break;
+            }
+
+            if self.jobs.is_empty() {
+                match main_receiver.recv() {
+                    Ok(msg) => match msg {
+                        Message::AssignJob(job) => self.jobs.push(job),
+                        Message::Close => shutting_down = true,
+                    },
+                    Err(_) => shutting_down = true,
+                }
+            }
+
+            if shutting_down
+                && self.jobs.is_empty()
+                && self.available_workers.len() == self.workers.len()
+            {
+                break;
+            }
+        }
+    }
+
+    pub fn assign_job(&mut self, worker_id: usize, job: Job) {
+        let worker = &self.workers[worker_id];
+        if let Some(sender) = &worker.assignment_sender {
+            sender.send(job).unwrap();
+        }
+    }
+}
+
+impl Drop for ManagerThread {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            if let Some(sender) = worker.assignment_sender.take() {
+                drop(sender)
+            }
+            if let Some(handle) = worker.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+```
+> worker.rs
+```rust
+use crate::manager::{Job, JobFinished};
+
+pub struct Worker {
+    pub id: usize,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+    pub assignment_sender: Option<std::sync::mpsc::Sender<Job>>,
+}
+
+impl Worker {
+    pub fn new(
+        id: usize,
+        receiver: std::sync::mpsc::Receiver<Job>,
+        assignment_sender: std::sync::mpsc::Sender<Job>,
+        feedback_sender: std::sync::mpsc::Sender<JobFinished>,
+    ) -> Self {
+        let handle = std::thread::spawn(move || {
+            println!("Worker {} starting", id);
+            loop {
+                match receiver.recv() {
+                    Ok(job) => {
+                        println!("Worker {} received job", id);
+                        job();
+                        println!("Worker {} finished job", id);
+                        feedback_sender.send(JobFinished { worker_id: id }).unwrap();
+                    }
+                    Err(_) => {
+                        println!("Worker {} shutting down", id);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            id,
+            handle: Some(handle),
+            assignment_sender: Some(assignment_sender),
+        }
+    }
+}
+```
+> main.rs
+```rust
+use lesson_1::manager::Manager;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let mut manager = Manager::start(4);
+    for i in 0..10 {
+        manager.schedule(Box::new(move || {
+            println!("Job {} is running", i);
+            thread::sleep(Duration::from_secs(1));
+            println!("job {} is done", i);
+        }));
+    }
+}
+```
+#### Output
+```
+Worker 0 starting
+Worker 3 starting
+Worker 3 received job
+Job 9 is running
+Worker 0 received job
+Job 6 is running
+Worker 1 starting
+Worker 1 received job
+Job 7 is running
+Worker 2 starting
+Worker 2 received job
+Job 8 is running
+job 9 is done
+Worker 3 finished job
+Worker 3 received job
+job 6 is done
+Worker 0 finished job
+job 7 is done
+Worker 1 finished job
+job 8 is done
+Worker 2 finished job
+Job 5 is running
+Worker 1 received job
+Worker 0 received job
+Job 4 is running
+Job 3 is running
+Worker 2 received job
+Job 2 is running
+job 5 is done
+Worker 3 finished job
+job 4 is done
+Worker 0 finished job
+Worker 3 received job
+Job 1 is running
+job 3 is done
+Worker 1 finished job
+job 2 is done
+Worker 2 finished job
+Worker 0 received job
+Job 0 is running
+job 1 is done
+Worker 3 finished job
+job 0 is done
+Worker 0 finished job
+(hangs here)
+```
+Hangs at end. I think I'll try to unify all messages to the manager thread into a single enum with variants for assigning jobs, main thead closing, and worker feedback. This should help with the issue of the manager thread being blocked.
+
+### Attempt 5 (unifying messages to manager thread)
+> manager.rs
+```rust
+use crate::worker::Worker;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::{self, JoinHandle};
+
+pub struct JobFinished {
+    pub worker_id: usize,
+}
+
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub enum Message {
+    AssignJob(Job),
+    WorkerFinished(JobFinished),
+    Close,
+}
+
+pub struct Manager {
+    main_sender: Sender<Message>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Manager {
+    pub fn start(num_workers: usize) -> Self {
+        let (main_sender, main_receiver): (Sender<Message>, Receiver<Message>) = mpsc::channel();
+        let cloned_sender = main_sender.clone();
+        let handle = thread::spawn(move || {
+            let mut manager = ManagerThread::new(num_workers, cloned_sender.clone());
+            manager.run(main_receiver);
+        });
+        Self {
+            main_sender,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn schedule(&mut self, job: Job) {
+        self.main_sender.send(Message::AssignJob(job)).unwrap();
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.main_sender.send(Message::Close).unwrap();
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        };
+    }
+}
+
+pub struct ManagerThread {
+    workers: Vec<Worker>,
+    available_workers: Vec<usize>,
+    jobs: Vec<Job>,
+}
+
+impl ManagerThread {
+    pub fn new(num_workers: usize, sender: Sender<Message>) -> Self {
+        let mut workers = Vec::new();
+        let mut available_workers = Vec::new();
+        for id in 0..num_workers {
+            let (assignment_sender, receiver) = mpsc::channel();
+            workers.push(Worker::new(id, receiver, assignment_sender, sender.clone()));
+            available_workers.push(id);
+        }
+        Self {
+            workers,
+            available_workers,
+            jobs: vec![],
+        }
+    }
+
+    pub fn run(&mut self, receiver: Receiver<Message>) {
+        let mut job_available: bool;
+        let mut worker_available: bool;
+        let mut shutting_down = false;
+
+        loop {
+            while let Ok(msg) = receiver.try_recv() {
+                match msg {
+                    Message::AssignJob(job) => self.jobs.push(job),
+                    Message::WorkerFinished(feedback) => {
+                        self.available_workers.push(feedback.worker_id)
+                    }
+                    Message::Close => shutting_down = true,
+                }
+            }
+
+            job_available = !self.jobs.is_empty();
+            worker_available = !self.available_workers.is_empty();
+
+            while job_available && worker_available {
+                let job = self.jobs.pop().unwrap();
+                let worker_id = self.available_workers.pop().unwrap();
+
+                self.assign_job(worker_id, job);
+
+                job_available = !self.jobs.is_empty();
+                worker_available = !self.available_workers.is_empty();
+            }
+
+            if shutting_down
+                && self.jobs.is_empty()
+                && self.available_workers.len() == self.workers.len()
+            {
+                break;
+            }
+
+            if self.jobs.is_empty() || self.available_workers.is_empty() {
+                match receiver.recv() {
+                    Ok(msg) => match msg {
+                        Message::AssignJob(job) => self.jobs.push(job),
+                        Message::Close => shutting_down = true,
+                        Message::WorkerFinished(feedback) => {
+                            self.available_workers.push(feedback.worker_id)
+                        }
+                    },
+                    Err(_) => shutting_down = true,
+                }
+            }
+
+            if shutting_down
+                && self.jobs.is_empty()
+                && self.available_workers.len() == self.workers.len()
+            {
+                break;
+            }
+        }
+    }
+
+    pub fn assign_job(&mut self, worker_id: usize, job: Job) {
+        let worker = &self.workers[worker_id];
+        if let Some(sender) = &worker.assignment_sender {
+            sender.send(job).unwrap();
+        }
+    }
+}
+
+impl Drop for ManagerThread {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            if let Some(sender) = worker.assignment_sender.take() {
+                drop(sender)
+            }
+            if let Some(handle) = worker.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+```
+
+> worker.rs
+```rust
+use crate::manager::{Job, JobFinished, Message};
+
+pub struct Worker {
+    pub id: usize,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+    pub assignment_sender: Option<std::sync::mpsc::Sender<Job>>,
+}
+
+impl Worker {
+    pub fn new(
+        id: usize,
+        receiver: std::sync::mpsc::Receiver<Job>,
+        assignment_sender: std::sync::mpsc::Sender<Job>,
+        feedback_sender: std::sync::mpsc::Sender<Message>,
+    ) -> Self {
+        let handle = std::thread::spawn(move || {
+            println!("Worker {} starting", id);
+            loop {
+                match receiver.recv() {
+                    Ok(job) => {
+                        println!("Worker {} received job", id);
+                        job();
+                        println!("Worker {} finished job", id);
+                        feedback_sender
+                            .send(Message::WorkerFinished(JobFinished { worker_id: id }))
+                            .unwrap();
+                    }
+                    Err(_) => {
+                        println!("Worker {} shutting down", id);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            id,
+            handle: Some(handle),
+            assignment_sender: Some(assignment_sender),
+        }
+    }
+}
+```
+
+> main.rs
+```rust
+use lesson_1::manager::Manager;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let mut manager = Manager::start(4);
+    for i in 0..10 {
+        manager.schedule(Box::new(move || {
+            println!("Job {} is running", i);
+            thread::sleep(Duration::from_secs(1));
+            println!("job {} is done", i);
+        }));
+    }
+}
+```
+#### Output
+```
+Worker 0 starting
+Worker 0 received job
+Job 6 is running
+Worker 2 starting
+Worker 2 received job
+Job 8 is running
+Worker 3 starting
+Worker 3 received job
+Job 9 is running
+Worker 1 starting
+Worker 1 received job
+Job 7 is running
+job 6 is done
+job 9 is done
+Worker 3 finished job
+job 7 is done
+Worker 1 finished job
+Worker 0 finished job
+Worker 0 received job
+Job 3 is running
+Worker 1 received job
+Job 4 is running
+job 8 is done
+Worker 2 finished job
+Worker 3 received job
+Job 5 is running
+Worker 2 received job
+Job 2 is running
+job 3 is done
+Worker 0 finished job
+job 4 is done
+Worker 1 finished job
+Worker 0 received job
+Job 1 is running
+Worker 1 received job
+Job 0 is running
+job 5 is done
+Worker 3 finished job
+job 2 is done
+Worker 2 finished job
+job 1 is done
+Worker 0 finished job
+job 0 is done
+Worker 1 finished job
+Worker 0 shutting down
+Worker 1 shutting down
+Worker 2 shutting down
+Worker 3 shutting down
+```
+Check it out. No more hanging at the end. Manager thread is able to receive worker feedback and main thread messages without blocking, and it shuts down gracefully when main thread is done. This is what I wanted to achieve.
