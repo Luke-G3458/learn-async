@@ -60,7 +60,8 @@ Producer → bounded queue → workers
 Block or drop when full
 Key insight:
 Systems fail when producers outrun consumers
-📚 Lesson 4 — Async Fundamentals (Under the Hood)
+
+## 📚 Lesson 4 — Async Fundamentals (Under the Hood)
 Learn
 Future
 Poll
@@ -75,7 +76,8 @@ Implement simple executor
 Poll futures in loop
 Outcome:
 You understand what .await actually does
-📚 Lesson 5 — Async in Practice
+
+## 📚 Lesson 5 — Async in Practice
 Learn
 tokio Rust crate basics
 async fn, .await
@@ -92,7 +94,8 @@ Handle disconnects
 Pain points:
 Shared state in async
 Lifetimes + Arc
-📚 Lesson 6 — Async State Management
+
+## 📚 Lesson 6 — Async State Management
 Learn
 Arc<Mutex<T>> in async
 Channels in async (tokio::mpsc)
@@ -105,7 +108,8 @@ Requirements
 Rooms/channels
 User tracking
 Message routing
-📚 Lesson 7 — Async + CPU Work
+
+## 📚 Lesson 7 — Async + CPU Work
 Learn
 Why async fails for CPU work
 spawn_blocking
@@ -118,7 +122,8 @@ Requirements
 Async API receives jobs
 CPU-heavy tasks run in threads
 Return results async
-📚 Lesson 8 — System Design with Concurrency
+
+## 📚 Lesson 8 — System Design with Concurrency
 Learn
 Event-driven architecture
 Decoupling via messaging
@@ -134,7 +139,8 @@ Message distribution
 Stretch:
 Persistence
 Replay
-📚 Lesson 9 — Multi-Process Systems
+
+## 📚 Lesson 9 — Multi-Process Systems
 Learn
 std::process
 IPC (pipes, sockets)
@@ -147,7 +153,7 @@ Requirements
 Spawn worker processes
 Communicate with them
 Restart on crash
-📚 Lesson 10 — Distributed Thinking
+## 📚 Lesson 10 — Distributed Thinking
 Learn
 Task queues
 Failure handling
@@ -188,7 +194,3 @@ Then we break it on purpose
 🚀 Final Note
 
 By Lesson 7–10, you’ll be building systems very similar to:
-
-PLC simulation engines
-Real-time tag systems
-Multi-component industrial software
